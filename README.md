@@ -1,3 +1,3 @@
-# jenkis-demo
+# jenkins-demo
 
-jenkis-demo
+jenkins-demo

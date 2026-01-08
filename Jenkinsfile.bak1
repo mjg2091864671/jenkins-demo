@@ -1,0 +1,218 @@
+/**
+ * 【SpringBoot项目Jenkins自动部署流水线】
+ * 核心功能：拉取Git代码 → Maven打包 → 部署到Linux服务器（优雅启停+版本备份+端口验证）
+ * 修复点：移除withMaven，手动配置JDK/Maven环境变量（兼容无Maven Pipeline插件的Jenkins）
+ */
+pipeline {
+    // agent any：使用任意可用的Jenkins节点执行流水线
+    agent any
+
+    // 流水线全局选项配置
+    options {
+        // 全局超时：30分钟未完成则终止，防止卡死
+        timeout(time: 30, unit: 'MINUTES')
+        // 保留最近10次构建日志，节省磁盘
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    // 环境变量定义（统一管理配置）
+    environment {
+        /************************ 服务器认证配置（安全规范） ************************/
+        // 从Jenkins凭据库读取服务器认证信息（避免明文硬编码）
+        // 操作：Jenkins → 凭据 → 系统 → 全局凭据 → 添加「Username with password」类型，ID填server-credential
+        SERVER_CRED = credentials('server-credential')
+        // 目标服务器IP
+        SERVER_IP = "192.168.31.61"
+        // 从凭据中提取用户名
+        SERVER_USER = "${SERVER_CRED_USR}"
+
+        /************************ 项目核心配置 ************************/
+        PROJECT_NAME = "jenkins-demo"
+        // JAR文件名（需和pom.xml中finalName一致）
+        JAR_NAME = "${PROJECT_NAME}-0.0.1-SNAPSHOT.jar"
+        // 服务器部署目录
+        DEPLOY_DIR = "/opt/apps/${PROJECT_NAME}"
+        // 版本备份目录（方便回滚）
+        BACKUP_DIR = "${DEPLOY_DIR}/backup"
+        // 应用日志文件路径
+        LOG_FILE = "${DEPLOY_DIR}/${PROJECT_NAME}.log"
+        // 应用监听端口（和SpringBoot配置一致）
+        PORT = 8070
+
+        /************************ Git仓库配置 ************************/
+        GIT_URL = "git@github.com:mjg2091864671/jenkins-demo.git"
+        GIT_BRANCH = "main"
+        // Jenkins中配置的Git SSH凭据ID
+        GIT_CREDENTIAL_ID = "github-ssh-key"
+
+        /************************ JVM启动参数（生产环境必备） ************************/
+        JVM_OPTS = "-Xms512m -Xmx1024m -XX:+UseG1GC -Dspring.profiles.active=prod"
+    }
+
+    // 工具配置（关联Jenkins全局工具，获取路径）
+    tools {
+        jdk 'JDK 17'    // 需和Jenkins全局工具配置的JDK名称一致
+        maven 'maven3.9.12' // 需和Jenkins全局工具配置的Maven名称一致
+    }
+
+    // 流水线阶段
+    stages {
+        // 阶段1：拉取Git代码
+        stage('拉取代码') {
+            options { timeout(time: 5, unit: 'MINUTES') } // 阶段超时控制
+            steps {
+                echo "开始拉取${PROJECT_NAME}代码...仓库：${GIT_URL} 分支：${GIT_BRANCH}"
+                // Jenkins Git拉取代码标准语法
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${GIT_BRANCH}"]], // 拉取远程分支
+                    userRemoteConfigs: [[
+                        url: "${GIT_URL}",
+                        credentialsId: "${GIT_CREDENTIAL_ID}" // Git认证凭据
+                    ]],
+                    // CleanCheckout：拉取前清理工作区，避免旧代码干扰
+                    extensions: [[$class: 'CleanCheckout']]
+                ])
+            }
+        }
+
+        // 阶段2：Maven打包（修复核心：手动配置环境变量，替代withMaven）
+        stage('Maven打包') {
+            options { timeout(time: 10, unit: 'MINUTES') }
+            steps {
+                echo "开始编译打包${PROJECT_NAME}..."
+                script {
+                    // 从Jenkins全局工具中获取JDK和Maven的安装路径
+                    def jdkHome = tool 'JDK 17'          // 获取JDK 17的绝对路径
+                    def mavenHome = tool 'maven3.9.12'   // 获取Maven 3.9.12的绝对路径
+
+                    // 手动配置环境变量，让当前shell识别JDK和Maven
+                    // 替代withMaven的核心逻辑，兼容无插件的Jenkins
+                    sh """
+                        # 配置JAVA_HOME（必须和项目JDK版本一致）
+                        export JAVA_HOME=${jdkHome}
+                        export PATH=\$JAVA_HOME/bin:\$PATH
+                        # 配置MAVEN_HOME
+                        export M2_HOME=${mavenHome}
+                        export PATH=\$M2_HOME/bin:\$PATH
+
+                        # 验证JDK和Maven版本（可选，方便排查环境问题）
+                        java -version
+                        mvn -version
+
+                        # Maven打包命令
+                        # clean：清理旧产物 | package：打包 | -Dmaven.test.skip=true：跳过测试 | -U：强制更新依赖
+                        mvn clean package -Dmaven.test.skip=true -U
+                    """
+                }
+
+                // 校验打包结果：避免打包失败但流水线继续执行
+                script {
+                    def jarPath = "target/${JAR_NAME}"
+                    if (!fileExists(jarPath)) {
+                        error "打包失败：${jarPath} 文件不存在！"
+                    }
+                    // 列出JAR包信息，便于日志中排查
+                    sh "ls -l ${jarPath}"
+                }
+            }
+        }
+
+        // 阶段3：部署到Linux服务器
+        stage('部署到Linux服务器') {
+            options { timeout(time: 15, unit: 'MINUTES') }
+            steps {
+                script {
+                    echo "开始部署${PROJECT_NAME}到${SERVER_IP}..."
+
+                    // 封装远程执行函数：简化重复的SSH命令
+                    def remoteExec = { String cmd ->
+                        sh "ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} '${cmd}'"
+                    }
+
+                    // 步骤1：创建部署/备份目录
+                    remoteExec("mkdir -p ${DEPLOY_DIR} ${BACKUP_DIR}")
+
+                    // 步骤2：优雅停止旧服务（先TERM信号，超时再强制kill）
+                    echo "停止旧的${PROJECT_NAME}服务..."
+                    remoteExec("""
+                        PID=\$(ps -ef | grep ${JAR_NAME} | grep -v grep | awk '{print \$2}')
+                        if [ -n "\$PID" ]; then
+                            kill \$PID && echo "发送停止信号给进程\$PID"
+                            sleep 5
+                            if ps -p \$PID > /dev/null; then
+                                kill -9 \$PID && echo "强制杀死进程\$PID"
+                            fi
+                        fi
+                    """)
+
+                    // 步骤3：备份旧版本（支持回滚）
+                    echo "备份旧版本jar包..."
+                    remoteExec("""
+                        if [ -f ${DEPLOY_DIR}/${JAR_NAME} ]; then
+                            cp ${DEPLOY_DIR}/${JAR_NAME} ${BACKUP_DIR}/${JAR_NAME}.\$(date +%Y%m%d%H%M%S)
+                            echo "旧版本已备份到${BACKUP_DIR}"
+                        fi
+                    """)
+
+                    // 步骤4：上传JAR包到服务器
+                    echo "上传${JAR_NAME}到${SERVER_IP}..."
+                    sh "scp -o StrictHostKeyChecking=no target/${JAR_NAME} ${SERVER_USER}@${SERVER_IP}:${DEPLOY_DIR}/"
+
+                    // 步骤5：启动新服务（日志轮转+JVM参数）
+                    echo "启动${PROJECT_NAME}服务..."
+                    remoteExec("""
+                        cd ${DEPLOY_DIR}
+                        # 日志轮转：避免单日志文件过大
+                        [ -f ${LOG_FILE} ] && mv ${LOG_FILE} ${LOG_FILE}.\$(date +%Y%m%d%H%M%S)
+                        # 启动命令：nohup后台运行 + JVM参数 + 日志重定向
+                        nohup java ${JVM_OPTS} -jar ${JAR_NAME} > ${LOG_FILE} 2>&1 &
+                    """)
+
+                    // 步骤6：验证服务启动（仅检查端口监听）
+                    echo "验证${PROJECT_NAME}服务启动状态..."
+                    def maxRetry = 30    // 最大重试30秒
+                    def retryCount = 0
+                    def serviceUp = false
+                    while (retryCount < maxRetry && !serviceUp) {
+                        sleep 1
+                        retryCount++
+                        // 检查端口是否监听
+                        def result = sh(
+                            script: "ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_IP} 'netstat -tulpn | grep :${PORT} || true'",
+                            returnStdout: true
+                        ).trim()
+                        if (result.contains("LISTEN")) {
+                            serviceUp = true
+                            echo "${PROJECT_NAME}服务启动成功！端口${PORT}已监听"
+                        }
+                    }
+                    // 超时未启动则终止并输出日志
+                    if (!serviceUp) {
+                        echo "部署失败，输出最新日志："
+                        remoteExec("tail -20 ${LOG_FILE}")
+                        error "${PROJECT_NAME}服务启动失败！超时${maxRetry}秒，端口${PORT}未监听"
+                    }
+                }
+            }
+        }
+    }
+
+    // 流水线后置操作
+    post {
+        success {
+            echo "===== ${PROJECT_NAME}部署成功！====="
+            echo "部署服务器：${SERVER_IP}"
+            echo "部署目录：${DEPLOY_DIR}"
+            echo "日志文件：${LOG_FILE}"
+        }
+        failure {
+            echo "===== ${PROJECT_NAME}部署失败！====="
+        }
+        always {
+            // 清理本地构建产物，节省磁盘
+            echo "清理本地构建产物..."
+            sh "rm -rf target/* || true"
+        }
+    }
+}

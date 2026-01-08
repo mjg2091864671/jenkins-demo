@@ -30,7 +30,7 @@ pipeline {
 
         /************************ 项目核心配置（可根据项目修改） ************************/
         // 项目名称（统一命名，便于识别）
-        PROJECT_NAME = "jenkis-demo"
+        PROJECT_NAME = "jenkins-demo"
         // 打包后的JAR文件名（需和pom.xml中finalName一致）
         JAR_NAME = "${PROJECT_NAME}-0.0.1-SNAPSHOT.jar"
         // 服务器部署目录
@@ -44,7 +44,7 @@ pipeline {
 
         /************************ Git仓库配置 ************************/
         // Git仓库地址（SSH方式，需配置Jenkins的SSH凭据）
-        GIT_URL = "git@github.com:mjg2091864671/jenkis-demo.git"
+        GIT_URL = "git@github.com:mjg2091864671/jenkins-demo.git"
         // 要拉取的分支
         GIT_BRANCH = "main"
         // Jenkins中配置的Git SSH凭据ID（新手操作：添加SSH密钥凭据，ID填github-ssh-key）
@@ -138,22 +138,18 @@ pipeline {
                     /************************ 步骤2：优雅停止旧服务（核心优化） ************************/
                     echo "停止旧的${PROJECT_NAME}服务..."
                     remoteExec("""
-                        # 查找应用进程ID（PID）：
-                        # ps -ef：列出所有进程
-                        # grep ${JAR_NAME}：筛选包含JAR包名的进程
-                        # grep -v grep：排除grep自身的进程
-                        # awk '{print \$2}'：提取第二列（PID）
-                        PID=\$(ps -ef | grep ${JAR_NAME} | grep -v grep | awk '{print \$2}')
-                        if [ -n "\$PID" ]; then
-                            # 优雅停止：发送TERM信号（让应用有时间保存数据、关闭连接，比kill -9更安全）
-                            kill \$PID && echo "发送停止信号给进程\$PID"
-                            # 等待5秒，给应用足够的停止时间
-                            sleep 5
-                            # 检查进程是否还存在，存在则强制杀死
-                            if ps -p \$PID > /dev/null; then
-                                kill -9 \$PID && echo "强制杀死进程\$PID"
-                            fi
-                        fi
+                        # 第一步：按端口查找并杀死占用进程（核心修复）
+                       # lsof -i:端口：查找占用端口的进程；-t：仅输出PID；xargs kill -9：强制杀死
+                       lsof -i:${PORT} -t | xargs kill -9 2>/dev/null || echo "端口${PORT}无占用进程"
+
+                       # 第二步：按JAR包名兜底杀死进程（兼容lsof未安装的情况）
+                       PID=\$(ps -ef | grep ${JAR_NAME} | grep -v grep | awk '{print \$2}')
+                       if [ -n "\$PID" ]; then
+                           kill \$PID && sleep 5
+                           if ps -p \$PID > /dev/null; then
+                               kill -9 \$PID && echo "强制杀死JAR进程\$PID"
+                           fi
+                       fi
                     """)
 
                     /************************ 步骤3：备份旧版本（支持回滚） ************************/

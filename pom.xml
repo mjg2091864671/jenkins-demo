@@ -9,10 +9,10 @@
         <relativePath/> <!-- lookup parent from repository -->
     </parent>
     <groupId>com.mjg</groupId>
-    <artifactId>jenkis-demo</artifactId>
+    <artifactId>jerkins-demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>jenkis-demo</name>
-    <description>jenkis-demo</description>
+    <name>jerkins-demo</name>
+    <description>jerkins-demo</description>
     <url/>
     <licenses>
         <license/>
